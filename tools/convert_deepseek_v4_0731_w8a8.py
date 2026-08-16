@@ -49,18 +49,32 @@ FP4_E2M1 = torch.tensor(
 )
 
 
+def decode_ue8m0_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Decode OCP UE8M0 bytes to positive FP32 scale factors.
+
+    The official 0731 checkpoint stores both MXFP4 and FP8 block scales as
+    safetensors ``F8_E8M0``.  On the PyTorch 2.5 stack used by P800 these are
+    loaded as their raw bytes, not as numerical floating-point values.
+    """
+    if scale.dtype not in (torch.uint8, torch.int8):
+        return scale.float()
+    scale_bytes = scale.view(torch.uint8)
+    if torch.any(scale_bytes == 0xFF):
+        raise ValueError("UE8M0 scale contains reserved NaN encoding 0xFF")
+    return torch.pow(2.0, scale_bytes.to(torch.float32) - 127.0)
+
+
 def dequantize_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Decode E2M1 pairs with UE8M0 scales (32 values per scale byte)."""
     if packed.dtype == torch.int8:
         packed = packed.view(torch.uint8)
     elif packed.dtype != torch.uint8:
         raise TypeError(f"MXFP4 values must be int8/uint8, got {packed.dtype}")
-    scale_bytes = scale.view(torch.uint8) if scale.dtype != torch.uint8 else scale
     low = packed.bitwise_and(0x0F).long()
     high = packed.bitwise_right_shift(4).bitwise_and(0x0F).long()
     unpacked = torch.stack((FP4_E2M1[low], FP4_E2M1[high]), dim=-1).flatten(-2)
     blocks = unpacked.reshape(*unpacked.shape[:-1], -1, 32)
-    scales = torch.pow(2.0, scale_bytes.to(torch.float32) - 127.0)
+    scales = decode_ue8m0_scale(scale)
     if scales.shape != blocks.shape[:-1]:
         scales = scales.reshape(blocks.shape[:-1])
     return (blocks * scales.unsqueeze(-1)).flatten(-2)
@@ -69,8 +83,9 @@ def dequantize_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 def dequantize_block_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Decode DeepSeek 128x128 block-FP8 tensors."""
     value = weight.float()
+    scale = decode_ue8m0_scale(scale)
     if scale.numel() == 1:
-        return value * scale.float()
+        return value * scale
     if value.ndim != 2 or scale.ndim != 2:
         raise ValueError(
             f"Block-FP8 expects 2-D weight/scale, got {value.shape}/{scale.shape}"
@@ -78,7 +93,7 @@ def dequantize_block_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Ten
     row_block = math.ceil(value.shape[0] / scale.shape[0])
     col_block = math.ceil(value.shape[1] / scale.shape[1])
     expanded = (
-        scale.float().repeat_interleave(row_block, 0).repeat_interleave(col_block, 1)
+        scale.repeat_interleave(row_block, 0).repeat_interleave(col_block, 1)
     )
     return value * expanded[: value.shape[0], : value.shape[1]]
 

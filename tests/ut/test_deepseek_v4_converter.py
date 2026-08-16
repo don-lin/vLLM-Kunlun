@@ -32,6 +32,20 @@ def test_mxfp4_signed_storage_preserves_nibbles():
     torch.testing.assert_close(out[0, 1::2], torch.full((16,), -6.0))
 
 
+def test_ue8m0_scale_decoding():
+    encoded = torch.tensor([115, 127, 130], dtype=torch.uint8)
+    decoded = converter.decode_ue8m0_scale(encoded)
+    torch.testing.assert_close(decoded, torch.tensor([2.0**-12, 1.0, 8.0]))
+
+
+def test_block_fp8_dequantizes_ue8m0_scale_bytes():
+    weight = torch.tensor([[8.0, -4.0], [2.0, 1.0]])
+    # A raw UE8M0 byte of 124 represents 2^-3, not the numeric value 124.
+    scale = torch.tensor([[124]], dtype=torch.uint8)
+    out = converter.dequantize_block_fp8(weight, scale)
+    torch.testing.assert_close(out, weight / 8.0)
+
+
 def test_channel_int8_roundtrip():
     weight = torch.tensor([[0.0, 1.0, -2.0], [10.0, -5.0, 2.5]])
     quantized, scale = converter.quantize_w8a8_channel(weight)
