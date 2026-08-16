@@ -139,6 +139,17 @@ tools/deepseek_v4_flash_0731/preflight.sh
 tools/deepseek_v4_flash_0731/serve_p800_tp8.sh
 ```
 
+脚本默认 `DSV4_GPU_MEMORY_UTILIZATION=0.72`，在当前 32K 配置上约占
+69.27 GiB/卡，并提供约 37540-token KV cache。可以按并发需求覆盖，例如：
+
+```bash
+DSV4_GPU_MEMORY_UTILIZATION=0.90 \
+tools/deepseek_v4_flash_0731/serve_p800_tp8.sh
+```
+
+`0.90` 会将更多空闲显存预留给 KV cache，总显存约回到 90.14 GiB/卡；它不会
+减少模型权重本身，只影响服务可接纳的活跃 token 数。
+
 后台启动会写入 `$DSV4_DEPLOY_ROOT/server.log` 和 `server.pid`，并最多等待 15 分钟
 直到 `/health` 返回成功：
 

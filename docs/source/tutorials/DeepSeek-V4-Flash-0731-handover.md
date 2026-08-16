@@ -80,6 +80,11 @@ xpu-smi
 tools/deepseek_v4_flash_0731/start_server.sh
 ```
 
+启动脚本当前默认 `DSV4_GPU_MEMORY_UTILIZATION=0.72`，对应约
+69.27 GiB/卡 idle 显存和约 37540-token KV cache。若现场更重视并发而不是释放
+显存，可在启动前覆盖该变量；恢复旧的 `0.90` 会回到约 90.14 GiB/卡和约
+67045-token KV cache。
+
 当前进程由新 `setsid` 脚本创建，可直接使用 `stop_server.sh`。仍应在停止后用
 `ps`、8000 端口和 `xpu-smi` 三重确认已清空。不要把宽泛的 `pkill python` 写进
 长期脚本。
@@ -172,6 +177,13 @@ conda create -y -p /root/vllm_p800/dsv4/conda \
   ```
 
 - Tool call 的 auto、required、指定函数和 auto 不调用均已通过。
+- 第一轮性能优化后，TP8 的 `wo_a` 已走现有 W8A8 linear kernel，compressor
+  GEMM 已去掉每次 forward 的完整 FP32 权重转换；30 次顺序 logprobs 回归通过。
+- 默认 0.72 显存配置约 69.27 GiB/卡，较旧 0.90 配置下降约
+  20.87 GiB/卡；短请求并发 16 实测约 145 QPM，4 并发强制输出合计约
+  6.23 tok/s。
+- 4101-token prefill 仍只有约 24.60 token/s，下一阶段必须优先替换 V4
+  reference sparse attention/indexer/compressor；只调整调度参数无法带来百倍提升。
 - 128K 临时实验可启动，但 126001-token 请求在 32768-token chunk 下 OOM；改成
   4096-token chunk 后预计单次 prefill 约 45–55 分钟，因此已恢复 32K 稳定配置。
 - 当前 32K 短请求峰值约 86 QPM；长输出单流约 1.89 token/s。

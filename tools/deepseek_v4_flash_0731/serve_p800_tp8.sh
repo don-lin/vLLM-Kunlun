@@ -20,7 +20,7 @@ exec "${vllm_bin}" serve "${DSV4_MODEL_DIR}" \
   --kv-cache-dtype bfloat16 \
   --block-size 256 \
   --max-model-len 32768 \
-  --gpu-memory-utilization 0.90 \
+  --gpu-memory-utilization "${DSV4_GPU_MEMORY_UTILIZATION:-0.72}" \
   --max-num-seqs 16 \
   --max-num-batched-tokens 32768 \
   --no-enable-prefix-caching \

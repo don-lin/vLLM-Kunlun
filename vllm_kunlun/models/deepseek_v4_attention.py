@@ -28,9 +28,15 @@ if TYPE_CHECKING:
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tensor:
-    out = x.float() * torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps)
+    # Reuse one FP32 conversion.  The compressor produces FP32 states while
+    # q/kv are BF16, and the current vendor RMSNorm kernel does not accept all
+    # of those dtype combinations.
+    x_fp32 = x.float()
+    out = x_fp32 * torch.rsqrt(
+        x_fp32.square().mean(dim=-1, keepdim=True) + eps
+    )
     if weight is not None:
-        out = out * weight.float()
+        out.mul_(weight.float())
     return out.to(x.dtype)
 
 
@@ -720,9 +726,14 @@ class KunlunDeepseekV4Attention(DeepseekV4Attention):
             compressor = self.compressor
 
             def compressor_kv_score():
-                return torch.mm(
-                    hidden_states.float(),
-                    compressor.fused_wkv_wgate.weight.T.float(),
+                # ``fused_wkv_wgate`` is intentionally unquantized, but the
+                # reference path converted its full weight matrix to FP32 on
+                # every forward.  Use P800's BF16-input/FP32-output GEMM
+                # directly instead.
+                return torch.ops._C.matmul(
+                    hidden_states,
+                    compressor.fused_wkv_wgate.weight,
+                    out_dtype=torch.float32,
                 )
 
             aux_fns[0] = compressor_kv_score
@@ -735,9 +746,10 @@ class KunlunDeepseekV4Attention(DeepseekV4Attention):
                 return weights
 
             def indexer_compressor_kv_score():
-                return torch.mm(
-                    hidden_states.float(),
-                    indexer.compressor.fused_wkv_wgate.weight.T.float(),
+                return torch.ops._C.matmul(
+                    hidden_states,
+                    indexer.compressor.fused_wkv_wgate.weight,
+                    out_dtype=torch.float32,
                 )
 
             aux_fns[1] = indexer_weights_proj
@@ -792,9 +804,15 @@ class KunlunDeepseekV4Attention(DeepseekV4Attention):
             o.shape[0], self.n_local_groups, heads_per_group * self.head_dim
         )
 
-        # wo_a is a grouped projection.  The generic LinearBase forward is a
-        # 2-D GEMM, so dequantize its per-channel W8A8 weights and perform the
-        # small grouped contraction explicitly.
+        # TP8 maps the eight output groups one-to-one to ranks, leaving exactly
+        # one local group.  In that validated deployment shape wo_a is an
+        # ordinary 2-D projection, so keep it on the optimized W8A8 linear
+        # kernel instead of dequantizing the entire matrix to FP32 on every
+        # token and every layer.
+        if self.n_local_groups == 1:
+            return self.wo_b(self.wo_a(grouped.flatten(1)))
+
+        # Generic fallback for future topologies with multiple local groups.
         weight = self.wo_a.weight
         if weight.dtype == torch.int8:
             scale = self.wo_a.weight_scale.float().reshape(-1)
@@ -867,35 +885,20 @@ class KunlunDeepseekV4Attention(DeepseekV4Attention):
 
         flat_swa_idx = swa_idx.reshape(q.shape[0], -1).long()
         # The current P800 DSA kernel rejects V4's selected-cache layout.
-        # Decode batches are small; gather only valid sparse rows per token and
-        # execute the exact BF16 MQA + attention-sink math eagerly.
-        for token in range(q.shape[0]):
-            gathered_parts = []
-            if comp_cache is not None:
-                assert comp_idx is not None
-                rows = comp_idx[token].long()
-                rows = rows[rows >= 0]
-                if rows.numel():
-                    gathered_parts.append(comp_cache.index_select(0, rows))
-            rows = flat_swa_idx[token]
-            rows = rows[rows >= 0]
-            if rows.numel():
-                gathered_parts.append(swa_cache.index_select(0, rows))
-            if not gathered_parts:
-                output[token].zero_()
-                continue
-
-            gathered = torch.cat(gathered_parts, dim=0).float()
-            scores = torch.einsum(
-                "hd,kd->hk", q[token].float(), gathered
-            ).mul_(self.scale)
-            sink_logits = self.attn_sink[: q.shape[1]].float().view(-1, 1)
-            probs = torch.softmax(
-                torch.cat((scores, sink_logits), dim=-1), dim=-1
-            )[:, :-1]
-            output[token].copy_(
-                torch.einsum("hk,kd->hd", probs, gathered).to(output.dtype)
+        # Execute the same bounded reference math for the whole decode batch,
+        # rather than launching a gather/softmax/einsum sequence separately
+        # for every request. This is especially important at max_num_seqs=16.
+        output.copy_(
+            _reference_sparse_attention(
+                q,
+                comp_cache,
+                comp_idx,
+                swa_cache,
+                flat_swa_idx,
+                self.scale,
+                self.attn_sink,
             )
+        )
 
     def _prefill(self, q, positions, output, sparse, swa) -> None:
         # Build physical sparse rows once on CPU, then execute attention in

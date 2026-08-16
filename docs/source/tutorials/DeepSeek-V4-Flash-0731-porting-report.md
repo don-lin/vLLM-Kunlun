@@ -191,3 +191,39 @@ byte，再按 UE8M0 定义计算 `2^(byte-127)`。旧逻辑把原始字节 115�
 
 性能优化应放在数值正确性之后。当前 reference fallback 很多，即使连续请求修好，
 还需要吞吐、延迟、显存水位和长时间稳定性验收。
+
+### 4.5 第一轮 P800 执行与显存优化
+
+2026-08-16 在 TP8 固定拓扑上完成了两项不会改变模型语义的高收益优化：
+
+- `wo_a` 在 TP8 下每个 rank 恰好只有一个 local output group，直接调用现有 W8A8
+  linear kernel；移除旧 reference 路径每层、每 token 将整个 INT8 权重反量化成
+  FP32 再执行 `einsum` 的开销；
+- compressor 的未量化 BF16 权重改用 P800 原生 BF16 输入、FP32 输出 GEMM，移除
+  每次 forward 对完整输入和权重执行 `.float()` 的临时张量。
+
+同时将启动脚本默认 `gpu_memory_utilization` 从 `0.90` 调整为可通过
+`DSV4_GPU_MEMORY_UTILIZATION` 覆盖的 `0.72`。模型权重实际仍为约
+36.13 GiB/卡；此前约 90.14 GiB/卡的总占用主要是 vLLM 主动预留了约
+39.27 GiB/卡 KV cache，并不是 286 GiB checkpoint 被复制成 600+ GiB 权重。
+
+优化后 32K 服务实测：
+
+- idle 显存约 69.27 GiB/卡，较 90.14 GiB/卡下降约 20.87 GiB/卡，
+  八卡合计下降约 167 GiB；
+- KV cache 约 21.99 GiB/卡，可容纳约 37540 tokens，32K 理论并发约 1.15；
+- 30 个顺序 logprobs 请求继续全部通过；
+- 1-token 短请求实测约 75 QPM（并发 1）、112 QPM（并发 4）和
+  145 QPM（并发 16）；
+- 强制 128-token 输出约 2.11 tok/s（单流）、3.65 tok/s（2 并发）和
+  6.23 tok/s（4 并发）；
+- 4101-token prefill 为 166.70 秒、24.60 token/s，说明 prefill 的主要瓶颈仍在
+  reference sparse attention/indexer/compressor，而不是上述 output projection；
+- required tool call 仍正确返回 `get_weather`，303 prompt + 62 completion tokens，
+  延迟 39.86 秒。
+
+这轮优化带来了显著短请求吞吐提升和可控的 KV 显存预算，但离数量级提升仍有较大
+距离。后续最大的收益点是为 V4 的 selected-cache + attention sink 布局实现可用的
+P800 sparse decode/prefill kernel，并替换 Python 循环、host sync 和 reference
+attention；当前 `kunlun_ops.fwd_kvcache_mla` 直接接入 V4 selected-cache 仍返回
+kernel error，不能在未验证数值和 sink 合并语义前强行启用。
