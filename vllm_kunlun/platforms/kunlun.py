@@ -267,12 +267,19 @@ class KunlunPlatform(Platform):
                         "DeepSeek V4 on Kunlun currently supports BF16 KV cache "
                         "only; use --kv-cache-dtype bfloat16."
                     )
-                if cache_config.block_size not in (None, 256):
-                    raise ValueError(
-                        "DeepSeek V4 on Kunlun requires --block-size 256; got "
-                        f"{cache_config.block_size}."
-                    )
-                cache_config.block_size = 256
+                # Before cache allocation this is the user-facing logical
+                # block size and the P800 MLA kernels require 256. After
+                # allocation, vLLM replaces it with the minimum physical
+                # block size across DeepSeek V4's hybrid cache groups (4 for
+                # the compressor cache) and calls this hook again during the
+                # engine/frontend handshake. Preserve that derived value.
+                if cache_config.num_gpu_blocks is None:
+                    if cache_config.block_size not in (None, 256):
+                        raise ValueError(
+                            "DeepSeek V4 on Kunlun requires --block-size 256; "
+                            f"got {cache_config.block_size}."
+                        )
+                    cache_config.block_size = 256
 
             max_model_len = getattr(model_config, "max_model_len", 0)
             if max_model_len > 32768:

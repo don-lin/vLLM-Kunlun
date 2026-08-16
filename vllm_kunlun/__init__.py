@@ -119,7 +119,33 @@ _register_post_import_hook(
 )
 
 
-# --- hook 2: qwen3_vl HAS_TRITON ------------------------------------------
+# --- hook 2: bind_kv_cache in gpu_model_runner ---------------------------
+# gpu_model_runner imports bind_kv_cache by name, so patch its cached local
+# reference as well as the defining worker.utils module.
+def _bind_kv_cache_applied(mod):
+    fn = getattr(mod, "bind_kv_cache", None)
+    return fn is not None and getattr(fn, "_kunlun_patched", False)
+
+
+def _bind_kv_cache_apply(mod):
+    if not hasattr(mod, "bind_kv_cache"):
+        return
+    from vllm_kunlun.v1.worker.utils import bind_kv_cache
+
+    mod.bind_kv_cache = bind_kv_cache
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched gpu_model_runner.bind_kv_cache"
+    )
+
+
+_register_post_import_hook(
+    "vllm.v1.worker.gpu_model_runner",
+    _bind_kv_cache_applied,
+    _bind_kv_cache_apply,
+)
+
+
+# --- hook 3: qwen3_vl HAS_TRITON ------------------------------------------
 # Triton kernel ``_bilinear_pos_embed_kernel`` is unsupported on Kunlun XPU.
 # Force the module to fall back to native pos-embed interpolation.
 def _qwen3vl_applied(mod):
@@ -213,6 +239,8 @@ def _qwen_triton_warmup_applied(mod):
 
 
 def _qwen_triton_warmup_apply(mod):
+    import types
+
     def _noop(*args, **kwargs):
         import logging
 
@@ -222,17 +250,65 @@ def _qwen_triton_warmup_apply(mod):
 
     _noop._kunlun_patched = True
     mod.qwen_triton_warmup = _noop
+    mod.deepseek_v4_sparse_mla_attention_warmup = _noop
     import logging
 
     logging.getLogger("vllm_kunlun").info(
-        "[KunlunPlugin] patched kernel_warmup.qwen_triton_warmup -> no-op"
+        "[KunlunPlugin] disabled CUDA/Triton-specific kernel warmups"
     )
+
+    # vLLM 0.25.1 imports the MiniMax-M3 warmup unconditionally from inside
+    # kernel_warmup(). Its NVIDIA Triton kernels use decorator arguments that
+    # the P800 Triton build does not implement, even when serving DeepSeek V4
+    # where that warmup would immediately be a no-op. Avoid importing that
+    # unrelated kernel module on Kunlun.
+    minimax_warmup_name = (
+        "vllm.model_executor.warmup.minimax_m3_msa_warmup"
+    )
+    if minimax_warmup_name not in sys.modules:
+        minimax_warmup_stub = types.ModuleType(minimax_warmup_name)
+
+        def _noop_minimax_m3_msa_warmup(*args, **kwargs):
+            return None
+
+        minimax_warmup_stub.minimax_m3_msa_warmup = (
+            _noop_minimax_m3_msa_warmup
+        )
+        sys.modules[minimax_warmup_name] = minimax_warmup_stub
+        logging.getLogger("vllm_kunlun").info(
+            "[KunlunPlugin] installed MiniMax-M3 warmup no-op"
+        )
 
 
 _register_post_import_hook(
     "vllm.model_executor.warmup.kernel_warmup",
     _qwen_triton_warmup_applied,
     _qwen_triton_warmup_apply,
+)
+
+
+# --- hook 7: disable the new Triton JIT monitor on the P800 runtime -------
+def _jit_monitor_applied(mod):
+    fn = getattr(mod, "activate", None)
+    return fn is not None and getattr(fn, "_kunlun_patched", False)
+
+
+def _jit_monitor_apply(mod):
+    if not hasattr(mod, "activate"):
+        return
+
+    def _noop_jit_monitor(*args, **kwargs):
+        return None
+
+    _noop_jit_monitor._kunlun_patched = True
+    mod.activate = _noop_jit_monitor
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] disabled incompatible Triton JIT monitor"
+    )
+
+
+_register_post_import_hook(
+    "vllm.utils.jit_monitor", _jit_monitor_applied, _jit_monitor_apply
 )
 
 
@@ -382,6 +458,47 @@ def register():
     for _dtype_name in ("float4_e2m1fn_x2", "float8_e8m0fnu"):
         if not hasattr(_torch, _dtype_name):
             setattr(_torch, _dtype_name, _UnsupportedTorchDType(_dtype_name))
+
+    if not hasattr(_torch.library, "wrap_triton"):
+
+        def _wrap_triton_eager(kernel):
+            # PyTorch 2.11's wrapper primarily makes a Triton kernel visible
+            # to torch.compile.  The validated Kunlun profile is eager-only;
+            # returning the kernel preserves its normal ``kernel[grid]`` API.
+            return kernel
+
+        _torch.library.wrap_triton = _wrap_triton_eager
+
+    try:
+        import torch.fx._graph_pickler  # noqa: F401
+    except ImportError:
+        # Imported unconditionally by vLLM's compile-cache helpers, including
+        # from eager-only workers.  Actual graph serialization is outside the
+        # supported profile, but the symbols must exist for worker startup.
+        import pickle as _pickle
+        import types as _types
+
+        _graph_pickler_stub = _types.ModuleType("torch.fx._graph_pickler")
+
+        class _GraphPicklerOptions:
+            def __init__(self, ops_filter=None):
+                self.ops_filter = ops_filter
+
+        class _GraphPickler:
+            def reducer_override(self, obj):
+                return NotImplemented
+
+            @staticmethod
+            def dumps(obj, options=None):
+                return _pickle.dumps(obj)
+
+            @staticmethod
+            def loads(data, fake_mode=None):
+                return _pickle.loads(data)
+
+        _graph_pickler_stub.GraphPickler = _GraphPickler
+        _graph_pickler_stub.Options = _GraphPicklerOptions
+        sys.modules["torch.fx._graph_pickler"] = _graph_pickler_stub
 
     # --- block vllm's NVIDIA prebuilt _C / _moe_C from being loaded ---
     # These are imported (via top-level ``import vllm._C`` in

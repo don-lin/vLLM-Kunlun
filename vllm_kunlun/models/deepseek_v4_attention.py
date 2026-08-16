@@ -19,8 +19,9 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
 )
+from vllm.utils.multi_stream_utils import execute_in_parallel
 
-from vllm_kunlun.ops.deep_gemm import int8_mqa_logits, int8_paged_mqa_logits
+from vllm_kunlun.ops.deep_gemm import int8_paged_mqa_logits
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -347,14 +348,20 @@ class KunlunDeepseekV4SparseAttnIndexer(torch.nn.Module):
                 self.scale_fmt,
             )
 
+        # vLLM's heterogeneous cache allocator may return a padded-page view,
+        # while the current P800 gather/paged-MQA kernels require contiguous
+        # indexer-cache storage. The quantized/compressed indexer cache is much
+        # smaller than the main KV cache; snapshot its logical rows after the
+        # insertion so native read kernels see the same block-table layout.
+        read_cache = kv_cache if kv_cache.is_contiguous() else kv_cache.contiguous()
         if indexer_metadata.prefill is not None:
             for chunk in indexer_metadata.prefill.chunks:
-                self._prefill(q_quant, weights, kv_cache, output, chunk)
+                self._prefill(q_quant, weights, read_cache, output, chunk)
         if indexer_metadata.decode is not None:
             self._decode(
                 q_quant,
                 weights,
-                kv_cache,
+                read_cache,
                 output,
                 indexer_metadata.decode,
                 indexer_metadata.num_decode_tokens,
@@ -362,54 +369,50 @@ class KunlunDeepseekV4SparseAttnIndexer(torch.nn.Module):
         return output
 
     def _prefill(self, q_quant, weights, kv_cache, output, chunk) -> None:
-        k_int8 = torch.empty(
-            (chunk.total_seq_lens, self.head_dim),
-            dtype=torch.int8,
-            device=q_quant.device,
+        # The P800 V3.2 fused prefill indexer assumes its original cache
+        # allocation/layout and can access out of bounds with V4's compressed,
+        # heterogeneous cache groups. Gather packed INT8+FP32-scale rows by the
+        # V4 block table and compute the small prefill reference explicitly.
+        cu_seq_lens_cpu = chunk.cu_seq_lens.cpu().tolist()
+        block_size = kv_cache.shape[1]
+        packed_rows = []
+        for req_idx in range(chunk.num_reqs):
+            seq_len = cu_seq_lens_cpu[req_idx + 1] - cu_seq_lens_cpu[req_idx]
+            if seq_len == 0:
+                continue
+            logical = torch.arange(seq_len, device=q_quant.device)
+            block_ids = chunk.block_table[req_idx].long().index_select(
+                0, logical // block_size
+            )
+            packed_rows.append(kv_cache[block_ids, logical % block_size])
+        packed = torch.cat(packed_rows, dim=0)
+        k_int8 = packed[:, : self.head_dim].view(torch.int8).float()
+        k_scales = (
+            packed[:, self.head_dim : self.head_dim + 4]
+            .contiguous()
+            .view(torch.float32)
+            .reshape(-1)
         )
-        k_scale_bytes = torch.empty(
-            (chunk.total_seq_lens, 4), dtype=torch.uint8, device=q_quant.device
-        )
-        torch.ops.xspeedgate_ops.cp_gather_indexer_k_quant_cache(
-            kv_cache=kv_cache,
-            dst_k=k_int8,
-            dst_scale=k_scale_bytes,
-            block_table=chunk.block_table,
-            cu_seq_lens=chunk.cu_seq_lens,
-        )
+
         token_slice = slice(chunk.token_start, chunk.token_end)
-        query_lens = torch.tensor(
-            [0, chunk.token_end - chunk.token_start],
-            dtype=torch.int32,
-            device=q_quant.device,
+        q_rows = q_quant[token_slice].float()
+        row_weights = weights[token_slice].float()
+        logits = torch.einsum(
+            "thd,kd,th->tk", q_rows, k_int8, row_weights
         )
-        key_lens = torch.tensor(
-            [0, chunk.total_seq_lens], dtype=torch.int32, device=q_quant.device
-        )
-        logits = int8_mqa_logits(
-            q_quant[token_slice],
-            (k_int8, k_scale_bytes.view(torch.float32)),
-            weights[token_slice],
-            chunk.cu_seqlen_ks,
-            chunk.cu_seqlen_ke,
-            query_lens,
-            query_lens.cpu(),
-            key_lens,
-            key_lens.cpu(),
-        )
+        logits *= k_scales.unsqueeze(0)
+
         topk = output[token_slice, : self.topk_tokens]
-        torch.ops.xspeedgate_ops.topk_per_row(
-            logits=logits,
-            srcIndices=topk,
-            numRows=logits.shape[0],
-            stride0=logits.stride(0),
-            stride1=logits.stride(1),
-            topK=self.topk_tokens,
-            rowStarts=chunk.cu_seqlen_ks,
-            rowEnds=chunk.cu_seqlen_ke,
-            seqLens=None,
-            next_n=None,
-        )
+        row_starts = chunk.cu_seqlen_ks.cpu().tolist()
+        row_ends = chunk.cu_seqlen_ke.cpu().tolist()
+        for row_idx, (start, end) in enumerate(zip(row_starts, row_ends)):
+            width = min(self.topk_tokens, end - start)
+            if width <= 0:
+                continue
+            local_indices = torch.topk(
+                logits[row_idx, start:end], width
+            ).indices
+            topk[row_idx, :width] = local_indices.to(topk.dtype)
 
     def _decode(
         self, q_quant, weights, kv_cache, output, metadata, num_decode_tokens
@@ -579,6 +582,23 @@ def _physical_slots(
     return torch.where(valid, slots, torch.full_like(slots, -1))
 
 
+def _index_copy_paged_cache_(
+    cache: torch.Tensor, slots: torch.Tensor, values: torch.Tensor
+) -> None:
+    """Write rows to a contiguous or padded-page KV cache in place."""
+    if slots.numel() == 0:
+        return
+    values = values.to(cache.dtype)
+    if cache.is_contiguous():
+        cache.view(-1, cache.shape[-1]).index_copy_(0, slots, values)
+        return
+
+    block_size = cache.shape[-2]
+    block_ids = torch.div(slots, block_size, rounding_mode="floor")
+    block_offsets = slots % block_size
+    cache[block_ids, block_offsets] = values
+
+
 def _reference_sparse_attention(
     q: torch.Tensor,
     compressed_cache: torch.Tensor | None,
@@ -615,7 +635,12 @@ def _reference_sparse_attention(
         valid = torch.cat(valid_parts, dim=1)
         scores = torch.einsum("thd,tkd->thk", q[start:end].float(), gathered.float())
         scores.mul_(scale).masked_fill_(~valid.unsqueeze(1), -float("inf"))
-        sink_logits = sink[: q.shape[1]].float().view(1, -1, 1)
+        sink_logits = (
+            sink[: q.shape[1]]
+            .float()
+            .view(1, -1, 1)
+            .expand(end - start, -1, -1)
+        )
         probs = torch.softmax(torch.cat((scores, sink_logits), dim=-1), dim=-1)[
             ..., :-1
         ]
@@ -630,9 +655,67 @@ class KunlunDeepseekV4Attention(DeepseekV4Attention):
     use_fp8_ds_mla_layout = False
     PREFILL_CHUNK_SIZE = 1
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # The P800 xBLAS runtime used by the supported deployment profile is
+        # not stable when V4 overlaps wq_b, indexer and compressor GEMMs on
+        # auxiliary streams. Keep the eager implementation on the default
+        # stream; all upstream call sites already have a sequential fallback
+        # when aux_stream_list is None.
+        self.aux_stream_list = None
+
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
+
+    def attn_gemm_parallel_execute(self, hidden_states) -> tuple:
+        """Run V4 input GEMMs without PyTorch 2.11's mm(out_dtype=...)."""
+        aux_streams = self.aux_stream_list
+        if aux_streams is not None:
+            assert len(aux_streams) >= 3
+            aux_streams = aux_streams[:3]
+        aux_fns = [None, None, None]
+
+        if self.compressor is not None:
+            compressor = self.compressor
+
+            def compressor_kv_score():
+                return torch.mm(
+                    hidden_states.float(),
+                    compressor.fused_wkv_wgate.weight.T.float(),
+                )
+
+            aux_fns[0] = compressor_kv_score
+
+        if self.indexer is not None:
+            indexer = self.indexer
+
+            def indexer_weights_proj():
+                weights, _ = indexer.weights_proj(hidden_states)
+                return weights
+
+            def indexer_compressor_kv_score():
+                return torch.mm(
+                    hidden_states.float(),
+                    indexer.compressor.fused_wkv_wgate.weight.T.float(),
+                )
+
+            aux_fns[1] = indexer_weights_proj
+            aux_fns[2] = indexer_compressor_kv_score
+
+        def fused_wqa_wkv():
+            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+            return qr_kv
+
+        qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
+            fused_wqa_wkv,
+            aux_fns,
+            self.ln_events[0],
+            self.ln_events[1:4],
+            aux_streams,
+            enable=False,
+        )
+        return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
         q = rms_norm(q, None, self.eps)
@@ -650,8 +733,10 @@ class KunlunDeepseekV4Attention(DeepseekV4Attention):
         slots = swa_metadata.slot_mapping.long()
         valid = slots >= 0
         if valid.any():
-            cache = self.swa_cache_layer.kv_cache.view(-1, self.head_dim)
-            cache.index_copy_(0, slots[valid], kv[valid].to(cache.dtype))
+            cache = self.swa_cache_layer.kv_cache
+            # Heterogeneous DeepSeek V4 cache groups may be packed into
+            # padded pages, so cache cannot always be flattened with view().
+            _index_copy_paged_cache_(cache, slots[valid], kv[valid])
         return q
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -740,59 +825,37 @@ class KunlunDeepseekV4Attention(DeepseekV4Attention):
                 comp_idx = comp_idx.reshape(q.shape[0], -1)
             comp_cache = self.kv_cache.reshape(-1, self.head_dim)
 
-        # Decode is the latency-critical path.  The existing Kunlun BF16 sparse
-        # MLA kernel returns its softmax statistics, which lets us add the V4
-        # attention sink exactly (the sink has a zero value vector).
-        from vllm_kunlun.ops.attention.flashmla import kunlun_flash_mla_with_kvcache
-
-        # Materialize only selected rows. Concatenating the full paged caches
-        # would duplicate the entire 32K cache on every layer invocation.
-        decode_chunk_size = 16
         flat_swa_idx = swa_idx.reshape(q.shape[0], -1).long()
-        for start in range(0, q.shape[0], decode_chunk_size):
-            end = min(start + decode_chunk_size, q.shape[0])
+        # The current P800 DSA kernel rejects V4's selected-cache layout.
+        # Decode batches are small; gather only valid sparse rows per token and
+        # execute the exact BF16 MQA + attention-sink math eagerly.
+        for token in range(q.shape[0]):
             gathered_parts = []
-            valid_parts = []
             if comp_cache is not None:
                 assert comp_idx is not None
-                rows = comp_idx[start:end].long()
-                valid_parts.append(rows >= 0)
-                gathered_parts.append(
-                    comp_cache.index_select(0, rows.clamp(min=0).flatten()).view(
-                        rows.shape[0], rows.shape[1], self.head_dim
-                    )
-                )
-            rows = flat_swa_idx[start:end]
-            valid_parts.append(rows >= 0)
-            gathered_parts.append(
-                swa_cache.index_select(0, rows.clamp(min=0).flatten()).view(
-                    rows.shape[0], rows.shape[1], self.head_dim
-                )
+                rows = comp_idx[token].long()
+                rows = rows[rows >= 0]
+                if rows.numel():
+                    gathered_parts.append(comp_cache.index_select(0, rows))
+            rows = flat_swa_idx[token]
+            rows = rows[rows >= 0]
+            if rows.numel():
+                gathered_parts.append(swa_cache.index_select(0, rows))
+            if not gathered_parts:
+                output[token].zero_()
+                continue
+
+            gathered = torch.cat(gathered_parts, dim=0).float()
+            scores = torch.einsum(
+                "hd,kd->hk", q[token].float(), gathered
+            ).mul_(self.scale)
+            sink_logits = self.attn_sink[: q.shape[1]].float().view(-1, 1)
+            probs = torch.softmax(
+                torch.cat((scores, sink_logits), dim=-1), dim=-1
+            )[:, :-1]
+            output[token].copy_(
+                torch.einsum("hk,kd->hd", probs, gathered).to(output.dtype)
             )
-            gathered = torch.cat(gathered_parts, dim=1)
-            valid = torch.cat(valid_parts, dim=1)
-            batch, width, _ = gathered.shape
-            selected_cache = gathered.reshape(batch * width, self.head_dim)
-            indices = torch.arange(
-                batch * width, device=q.device, dtype=torch.int32
-            ).view(batch, width)
-            indices.masked_fill_(~valid, -1)
-            selected_lens = valid.sum(dim=-1, dtype=torch.int32)
-            attn_out, max_logits, p_sums = kunlun_flash_mla_with_kvcache(
-                q=q[start:end].unsqueeze(1),
-                k_cache=selected_cache,
-                cache_seqlens=selected_lens,
-                cache_seqlens_cpu=selected_lens.cpu(),
-                head_dim_v=self.head_dim,
-                softmax_scale=self.scale,
-                indices=indices.unsqueeze(1),
-                max_seq_kv=selected_cache.shape[0],
-            )
-            sink_exp = torch.exp(
-                self.attn_sink[: q.shape[1]].view(1, 1, -1) - max_logits
-            )
-            sink_factor = p_sums / (p_sums + sink_exp).clamp_min(1e-20)
-            output[start:end].copy_((attn_out * sink_factor.unsqueeze(-1)).squeeze(1))
 
     def _prefill(self, q, positions, output, sparse, swa) -> None:
         # Build physical sparse rows once on CPU, then execute attention in
@@ -864,7 +927,7 @@ class KunlunDeepseekCompressor(DeepseekCompressor):
         state_meta = metadata[self.state_cache.prefix]
         slots = state_meta.slot_mapping.long()
         valid = slots >= 0
-        state = self.state_cache.kv_cache.view(-1, self.state_cache.kv_cache.shape[-1])
+        state_cache = self.state_cache.kv_cache
         if valid.any():
             packed = torch.cat(
                 (
@@ -873,12 +936,13 @@ class KunlunDeepseekCompressor(DeepseekCompressor):
                 ),
                 dim=-1,
             )
-            state.index_copy_(0, slots[valid], packed[valid].to(state.dtype))
+            _index_copy_paged_cache_(state_cache, slots[valid], packed[valid])
 
         boundary = valid & ((positions + 1).remainder(self.compress_ratio) == 0)
         token_ids = boundary.nonzero(as_tuple=False).flatten()
         if token_ids.numel() == 0:
             return
+        state = state_cache.reshape(-1, state_cache.shape[-1])
         reqs = state_meta.token_to_req_indices.cpu().tolist()
         pos_list = positions.cpu().tolist()
         outputs = []
@@ -897,11 +961,11 @@ class KunlunDeepseekCompressor(DeepseekCompressor):
             offset_mask = logical >= (pos - self.compress_ratio + 1)
             head_offset = offset_mask.long() * self.head_dim
             col = torch.arange(self.head_dim, device=values.device)
-            gathered_kv = values[:, head_offset[:, None] + col]
-            gathered_score = values[
-                :,
-                self.coff * self.head_dim + head_offset[:, None] + col,
-            ]
+            row_columns = head_offset[:, None] + col[None, :]
+            gathered_kv = values.gather(1, row_columns)
+            gathered_score = values.gather(
+                1, self.coff * self.head_dim + row_columns
+            )
             compressed = (
                 torch.softmax(gathered_score.float(), dim=0) * gathered_kv.float()
             ).sum(dim=0)
@@ -928,9 +992,8 @@ class KunlunDeepseekCompressor(DeepseekCompressor):
         k_layer = self._static_forward_context[self.k_cache_prefix]
         k_cache = k_layer.kv_cache
         if k_cache.dtype == torch.bfloat16:
-            flat = k_cache.view(-1, self.head_dim)
             good = out_slots >= 0
-            flat.index_copy_(0, out_slots[good], values[good].to(flat.dtype))
+            _index_copy_paged_cache_(k_cache, out_slots[good], values[good])
         else:
             # The Lightning Indexer cache remains int8+scale and is consumed by
             # the existing Kunlun sparse-indexer kernels.

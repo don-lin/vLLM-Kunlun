@@ -3,19 +3,55 @@
 """Kunlun-specific monkey-patches for ``vllm.v1.worker.utils``.
 
 This module does NOT replace ``vllm.v1.worker.utils``; it patches the
-``KVBlockZeroer`` class in place so the very same class object captured
-elsewhere (e.g. ``from vllm.v1.worker.utils import KVBlockZeroer`` at
-``gpu_model_runner`` top level) is mutated.
+``KVBlockZeroer`` class in place and provides the Kunlun ``bind_kv_cache``
+variant used by ``gpu_model_runner``.
 
 Triggering: imported from ``vllm_kunlun.__init__`` after the import
 hook is installed, ensuring upstream is loaded first.
 """
 
 import logging
+from collections import defaultdict
 
-from vllm.v1.worker.utils import KVBlockZeroer as _upstream_cls
+import vllm.v1.worker.utils as _upstream_utils
+from vllm.model_executor.models.utils import extract_layer_index
+
+_upstream_cls = _upstream_utils.KVBlockZeroer
 
 logger = logging.getLogger("vllm_kunlun")
+
+
+def bind_kv_cache(
+    kv_caches: dict[str, object],
+    forward_context: dict[str, object],
+    runner_kv_caches: list[object],
+    num_attn_module: int = 1,
+) -> None:
+    """Bind KV caches without treating Kunlun's OOT platform as unsupported.
+
+    DeepSeek V4 exposes multiple attention/cache entries with the same layer
+    index. Upstream already supports that layout in the GPU, XPU and CPU model
+    runners, but gates it on built-in platform enums. Kunlun uses the same GPU
+    runner while registering as an OOT platform, so keep the upstream binding
+    behavior without that enum-only guard.
+    """
+    assert len(runner_kv_caches) == 0
+
+    index2name = defaultdict(list)
+    for layer_name in kv_caches:
+        layer_index = extract_layer_index(layer_name, num_attn_module)
+        index2name[layer_index].append(layer_name)
+
+    for layer_index in sorted(index2name):
+        for layer_name in index2name[layer_index]:
+            runner_kv_caches.append(kv_caches[layer_name])
+
+    for layer_name, kv_cache in kv_caches.items():
+        forward_context[layer_name].kv_cache = kv_cache
+
+
+bind_kv_cache._kunlun_patched = True
+_upstream_utils.bind_kv_cache = bind_kv_cache
 
 
 def _init_meta(
