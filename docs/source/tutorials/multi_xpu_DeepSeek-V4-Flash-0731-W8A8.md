@@ -156,6 +156,15 @@ max-model-len=32768, max-num-seqs=16, eager,
 no-prefix-cache, no-async-scheduling
 ```
 
+启动脚本同时启用 upstream vLLM 0.25.1 自带的 DeepSeek V4 DSML tool parser：
+
+```text
+--enable-auto-tool-choice --tool-call-parser deepseek_v4
+```
+
+已验证 `tool_choice=auto`、`required` 和指定函数名均能返回 OpenAI 格式的
+`tool_calls`；普通问题在 `auto` 模式下不会被强制转成工具调用。
+
 ## 7. 验收：必须测试连续请求
 
 基础接口检查：

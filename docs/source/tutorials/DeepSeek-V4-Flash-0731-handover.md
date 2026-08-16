@@ -163,6 +163,19 @@ conda create -y -p /root/vllm_p800/dsv4/conda \
 3. 与 NVIDIA upstream 运行同一 W8A8 checkpoint 做输出/评测对比。
 4. 记录 torch-native logprob 和 scratch cache fallback 的性能开销。
 
+## 9. 2026-08-16 补充测试
+
+- 当前稳定服务已启用：
+
+  ```text
+  --enable-auto-tool-choice --tool-call-parser deepseek_v4
+  ```
+
+- Tool call 的 auto、required、指定函数和 auto 不调用均已通过。
+- 128K 临时实验可启动，但 126001-token 请求在 32768-token chunk 下 OOM；改成
+  4096-token chunk 后预计单次 prefill 约 45–55 分钟，因此已恢复 32K 稳定配置。
+- 当前 32K 短请求峰值约 86 QPM；长输出单流约 1.89 token/s。
+
 采集现场信息可运行：
 
 ```bash

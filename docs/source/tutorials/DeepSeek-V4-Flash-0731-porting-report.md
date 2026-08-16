@@ -15,6 +15,7 @@ P800 上加载和提供 OpenAI API。实现没有采用仓库 PR #402 的代码�
 - 已修复异构 packed-page indexer cache 写入污染相邻 SWA cache 的问题；
 - 已修复 P800 上 vLLM 0.25.1 GPU sampler Triton logprob kernel 返回非有限值的问题；
 - 30 个顺序确定性 logprobs 请求、多轮请求和 2 并发冒烟已通过；
+- DeepSeek V4 tool parser 的 auto/required/指定函数调用已通过；
 - 长上下文、长期稳定性、性能和准确率对比尚未完成，因此仍不应直接标记为生产就绪。
 
 ## 2. 提交脉络
@@ -150,6 +151,7 @@ byte，再按 UE8M0 定义计算 `2^(byte-127)`。旧逻辑把原始字节 115�
 | `logprobs` | 通过 | 返回有限 FP32 logprob，HTTP 200 |
 | 多轮对话 | 冒烟通过 | “记住 17，再加 6”返回 23 |
 | 2 并发 | 冒烟通过 | 首都和算术请求均正确 |
+| Tool call | 通过 | auto、required、指定函数均正确解析参数 |
 | `--no-async-scheduling` A/B | 无修复 | 排除 async scheduling 是唯一原因 |
 | 强制 KV zero A/B | 无修复 | 8 worker 均注册 62 tensors，问题仍复现 |
 
@@ -167,6 +169,25 @@ byte，再按 UE8M0 定义计算 `2^(byte-127)`。旧逻辑把原始字节 115�
 4. 评估 compact scratch + 行复制和 torch-native logprob fallback 的吞吐代价；
 5. 若厂商 runtime 后续支持带真实 stride 的 indexer writer，可替换当前 correctness
    fallback。
+
+### 4.4 128K 与性能补充测试
+
+模型原始 config 声明 1M/YARN。临时放开平台检查后，128K 服务可以启动：
+
+- `/v1/models` 显示 `max_model_len=131072`；
+- KV cache 约 259742 tokens，vLLM 估算 128K 理论并发约 1.98；
+- `max_num_batched_tokens=32768` 时，126001-token prefill 额外申请约 32 GiB/卡并 OOM；
+- 降到 4096 后不再立即 OOM，但 5 分钟只完成约 13900 tokens，推算完整 prefill
+  约需 45–55 分钟，且每卡显存约 93.7 GiB。
+
+因此 128K 在当前 reference fallback 上不具备实用性能，平台默认仍限制为 32K。
+
+32K 配置实测基线：
+
+- 1-token 短请求：约 57 QPM（并发 1）至 86 QPM（并发 16）；
+- 对应总 TPM 约 1087 至 1637；
+- 长输出：单流约 1.89 output token/s，4 并发合计约 5.69 output token/s；
+- 4090-token prefill：端到端约 164.65 秒，约 24.84 prompt token/s。
 
 性能优化应放在数值正确性之后。当前 reference fallback 很多，即使连续请求修好，
 还需要吞吐、延迟、显存水位和长时间稳定性验收。

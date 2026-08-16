@@ -27,4 +27,6 @@ exec "${vllm_bin}" serve "${DSV4_MODEL_DIR}" \
   --no-async-scheduling \
   --enforce-eager \
   --trust-remote-code \
+  --enable-auto-tool-choice \
+  --tool-call-parser deepseek_v4 \
   "$@"
