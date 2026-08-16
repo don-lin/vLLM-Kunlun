@@ -145,6 +145,61 @@ _register_post_import_hook(
 )
 
 
+# --- hook 3: logprob kernels in the v0.25.1 GPU sampler -------------------
+# The upstream sampler computes selected-token logprobs and ranks with Triton.
+# P800's Triton build can execute these kernels without raising, but the
+# resulting logprobs are non-finite. The OpenAI API then fails while encoding
+# the response as strict JSON. Patch both the defining module and the sampler's
+# cached ``from ... import compute_topk_logprobs`` reference to use the eager
+# torch implementation.
+def _logprob_ops_applied(mod):
+    fn = getattr(mod, "compute_topk_logprobs", None)
+    return fn is not None and getattr(fn, "_kunlun_patched", False)
+
+
+def _logprob_ops_apply(mod):
+    from vllm_kunlun.v1.worker.gpu.sample.logprob import (
+        compute_token_logprobs,
+        compute_topk_logprobs,
+    )
+
+    mod.compute_token_logprobs = compute_token_logprobs
+    mod.compute_topk_logprobs = compute_topk_logprobs
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched GPU sampler logprob kernels"
+    )
+
+
+_register_post_import_hook(
+    "vllm.v1.worker.gpu.sample.logprob",
+    _logprob_ops_applied,
+    _logprob_ops_apply,
+)
+
+
+def _gpu_sampler_logprobs_applied(mod):
+    fn = getattr(mod, "compute_topk_logprobs", None)
+    return fn is not None and getattr(fn, "_kunlun_patched", False)
+
+
+def _gpu_sampler_logprobs_apply(mod):
+    if not hasattr(mod, "compute_topk_logprobs"):
+        return
+    from vllm_kunlun.v1.worker.gpu.sample.logprob import compute_topk_logprobs
+
+    mod.compute_topk_logprobs = compute_topk_logprobs
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] rebound GPU Sampler.compute_topk_logprobs"
+    )
+
+
+_register_post_import_hook(
+    "vllm.v1.worker.gpu.sample.sampler",
+    _gpu_sampler_logprobs_applied,
+    _gpu_sampler_logprobs_apply,
+)
+
+
 # --- hook 3: qwen3_vl HAS_TRITON ------------------------------------------
 # Triton kernel ``_bilinear_pos_embed_kernel`` is unsupported on Kunlun XPU.
 # Force the module to fall back to native pos-embed interpolation.

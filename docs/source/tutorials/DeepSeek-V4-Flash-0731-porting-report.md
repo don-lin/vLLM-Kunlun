@@ -11,9 +11,11 @@ P800 上加载和提供 OpenAI API。实现没有采用仓库 PR #402 的代码�
 - 已完成模型注册、权重转换、P800 reference attention/mHC、MoE routing、平台约束
   和 vLLM 0.25.1 运行时兼容层；
 - 已完成一次全量官方 checkpoint 转换，并在 8 张 P800 上完成完整加载；
-- `/health` 和 `/v1/models` 正常，冷启动后的首个贪心请求可得到正确答案；
-- 连续第二个独立请求仍会出现 token id 0 / 重复 BOS，logprobs 路径会出现非有限值；
-- 所以当前是“启动、加载、首请求链路打通”，不是“生产部署完成”。
+- `/health` 和 `/v1/models` 正常；
+- 已修复异构 packed-page indexer cache 写入污染相邻 SWA cache 的问题；
+- 已修复 P800 上 vLLM 0.25.1 GPU sampler Triton logprob kernel 返回非有限值的问题；
+- 30 个顺序确定性 logprobs 请求、多轮请求和 2 并发冒烟已通过；
+- 长上下文、长期稳定性、性能和准确率对比尚未完成，因此仍不应直接标记为生产就绪。
 
 ## 2. 提交脉络
 
@@ -26,6 +28,9 @@ P800 上加载和提供 OpenAI API。实现没有采用仓库 PR #402 的代码�
 | `9d53e59` | 实机加载后发现的 attention、block table、KV bind 等修复 |
 | `845ad0e` | 修复 dense block-FP8 的 UE8M0 scale 解码 |
 | `294971b` | 按 vLLM 0.25.1 的真实构造入口修正 KVBlockZeroer 补丁 |
+
+本次接手又新增两类修复，尚待提交：P800 logprob 的 torch-native FP32 fallback，
+以及 DeepSeek V4 indexer cache 在异构 packed-page 上的安全写入。
 
 PR #402 没有被当成实现来源或正确性依据。模型结构以 upstream vLLM 0.25.1 的
 DeepSeek V4 实现为语义基线，再针对 Kunlun OOT platform 和 P800 可用算子做适配。
@@ -51,6 +56,9 @@ DeepSeek V4 实现为语义基线，再针对 Kunlun OOT platform 和 P800 可�
   覆盖 RoPE/RMSNorm、compressed slot 和 metadata 构建、sparse indexer、BF16 sparse
   attention、compressor，以及连续/带 padding cache 的访问。upstream 依赖但当前
   `kunlun_ops` 不提供或签名不兼容的 fused kernel 会落到 PyTorch 实现。
+  本次进一步确认，`indexer_k_quant_and_cache` 不能直接接收异构分配器返回的
+  非连续 packed-page view；现在先在紧凑 scratch cache 中量化，再按目标 view 的
+  真实 stride 将有效行逐行复制回去。
 - `vllm_kunlun/models/deepseek_v4_mhc.py`：加入 torch-native mHC，实现当前设备上
   可执行的 residual mixing 路径。
 
@@ -84,11 +92,15 @@ byte，再按 UE8M0 定义计算 `2^(byte-127)`。旧逻辑把原始字节 115�
   并让 KVBlockZeroer 覆盖 vLLM 0.25.1 实际调用的 `__init__` API。zeroer 的 eager
   清理仅在 upstream cache config 请求 zeroing 时工作；“强制给所有 MLA cache
   zero”已做过 A/B，不能修复当前连续请求问题，因此没有把该实验开关作为方案。
+- `vllm_kunlun/v1/worker/gpu/sample/logprob.py`：使用 FP32
+  `logsumexp`/gather 和 torch rank 计算替换 P800 上静默产生非有限值的 Triton
+  logprob kernel；`vllm_kunlun/__init__.py` 同时 patch 定义模块和 sampler 已缓存的
+  `compute_topk_logprobs` 引用。
 
 ### 3.5 测试与文档
 
 - `tests/ut/test_deepseek_v4_converter.py`：覆盖 MXFP4、block-FP8、UE8M0 raw byte、
-  tensor companion/recipe 等转换行为；本地 8 项测试通过。
+  tensor companion/recipe 等转换行为；加上 logprob 2 项测试，本地共 10 项通过。
 - `tools/deepseek_v4_flash_0731/`：新增基础环境、并发下载、转换、checkpoint 校验、
   启停、连续请求验收和诊断采集脚本。
 - 本报告、空白机部署指南和当前机器接手文档分别记录“改了什么”“如何复现”以及
@@ -133,28 +145,28 @@ byte，再按 UE8M0 定义计算 `2^(byte-127)`。旧逻辑把原始字节 115�
 |---|---|---|
 | 完整模型加载 | 通过 | architecture、权重映射和显存分配已连通 |
 | `/health`、`/v1/models` | 通过 | API 和 engine 就绪，不代表数值正确 |
-| 冷启动后首请求 | 可通过 | 曾正确回答“法国的首都是巴黎”“中国的首都是北京” |
-| 同进程第二个独立请求 | 失败 | token id 0、重复 `<｜begin▁of▁sentence｜>` |
-| `logprobs` | 失败 | 非有限 float 无法编码为 JSON，返回 400 |
+| 冷启动后首请求 | 通过 | 正确回答首都和简单算术 |
+| 30 个顺序独立请求 | 通过 | 每个请求启用 logprobs，未出现 token 0 |
+| `logprobs` | 通过 | 返回有限 FP32 logprob，HTTP 200 |
+| 多轮对话 | 冒烟通过 | “记住 17，再加 6”返回 23 |
+| 2 并发 | 冒烟通过 | 首都和算术请求均正确 |
 | `--no-async-scheduling` A/B | 无修复 | 排除 async scheduling 是唯一原因 |
 | 强制 KV zero A/B | 无修复 | 8 worker 均注册 62 tensors，问题仍复现 |
 
-因此，`/health=200`、显存占用正常或“首请求答对”都不能单独作为验收结果。
+故障定位证据是：旧 writer 在第 10 个短请求进入新 block 时，使 layer 0 SWA cache
+出现 148 个非有限 BF16 元素；改成 compact scratch + stride-safe copy 后，30 个
+连续 logprobs 请求稳定通过。
 
 ## 5. 当前限制与下一步
 
-最高优先级是定位“首请求之后产生或遗留的非有限状态”。建议按以下顺序继续：
+后续优先级：
 
-1. 用两个 `max_tokens=1` 的顺序请求缩短路径，在每个 decoder layer 边界记录
-   hidden state/logits 的 finite、min/max，确定第二请求第一次出错的层；
-2. 在首请求前后计算只读的参数/buffer fingerprint，排查 weight 或常驻 buffer 被
-   in-place 修改；
-3. 重点检查 sparse indexer、compressor、top-k indices buffer、request index、
-   block table 和 metadata 的请求间 reset，而不是继续盲目扩大 KV zero 范围；
-4. 在找到第一个非有限张量后，再对照 upstream CUDA/XPU 路径核查 shape、stride、
-   slot mapping 和生命周期；
-5. 修复后重复运行连续请求、logprobs、多轮对话、并发与长上下文测试，再做 NVIDIA
-   upstream 同一 W8A8 checkpoint 的准确率对比。
+1. 运行更长时间的顺序/并发 soak test，并覆盖 block 反复释放和复用；
+2. 验证 32K 长上下文、chunked prefill 和不同 prompt 长度；
+3. 与 NVIDIA upstream 同一 W8A8 checkpoint 做贪心输出和评测集对比；
+4. 评估 compact scratch + 行复制和 torch-native logprob fallback 的吞吐代价；
+5. 若厂商 runtime 后续支持带真实 stride 的 indexer writer，可替换当前 correctness
+   fallback。
 
 性能优化应放在数值正确性之后。当前 reference fallback 很多，即使连续请求修好，
 还需要吞吐、延迟、显存水位和长时间稳定性验收。

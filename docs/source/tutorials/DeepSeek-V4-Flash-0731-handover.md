@@ -51,26 +51,15 @@ curl http://127.0.0.1:8000/v1/models
 tail -n 200 /root/vllm_p800/dsv4/server.log
 ```
 
-2026-08-16 15:50 CST 的最后一次检查中，API server PID 为 162850、EngineCore PID
-为 163060；八张卡各使用 90138 MiB，`/health=200`。这些数字只用于识别现场，
-不应写死在启停脚本。
-日志中八个 worker 都出现过：
-
-```text
-KVBlockZeroer registered 62 tensors from 3 groups (specs=['MLAAttentionSpec'])
-```
-
-这表示强制 zero 的实验确实进入了 worker，不表示它修好了生成。
+2026-08-16 17:20 CST 的最后一次检查中，API server PID 为 203472、EngineCore PID
+为 203784；八张卡各使用约 90136–90138 MiB，`/health=200`。这些数字只用于识别
+现场，不应写死在启停脚本。当前进程没有设置 `VLLM_KUNLUN_FORCE_KV_ZERO`。
 
 ## 4. 当前服务与本地仓库的差异
 
-当前远端运行实例带有一次诊断实验：`VLLM_KUNLUN_FORCE_KV_ZERO=1`，远端源码也曾
-临时加入“DeepSeek MLA 一律要求 zero”的 property patch。A/B 已证明它不能修复
-连续第二请求，因此本地工作分支没有保留这个未提交实验，只保留了与 vLLM 0.25.1
-构造 API 匹配的通用 KVBlockZeroer eager 实现。
-
-接手者若要获得可复现基线，应先同步当前 Git 分支到远端、确认 `git status` 干净，
-再用新工具脚本重启；不要把当前进程内的 force-zero 状态误认为最终设计。
+当前远端运行源码已与本地未提交修改同步，服务使用新工具脚本启动。远端目录本身
+没有 `.git` 元数据，因此不能在远端用 `git status` 证明一致性；同步后曾用关键文件
+SHA256 对比确认一致。最终应把本地修改提交并再同步一次，避免后续无法追溯。
 
 ## 5. 安全重启方法
 
@@ -91,11 +80,9 @@ xpu-smi
 tools/deepseek_v4_flash_0731/start_server.sh
 ```
 
-当前旧进程不是由新 `setsid` 脚本创建的。第一次迁移时应读取 PID/命令行，确认它们
-确实属于这个 DeepSeek 模型，然后终止 API server 及其 EngineCore/worker 子进程，
-再用 `ps`、8000 端口和 `xpu-smi` 三重确认已清空。曾经因 stale PID 同时留下三个
-API server，所以“kill PID 文件里的一个数字”不够。不要把宽泛的 `pkill python`
-写进长期脚本；新 `stop_server.sh` 用独立进程组和命令行校验规避这个问题。
+当前进程由新 `setsid` 脚本创建，可直接使用 `stop_server.sh`。仍应在停止后用
+`ps`、8000 端口和 `xpu-smi` 三重确认已清空。不要把宽泛的 `pkill python` 写进
+长期脚本。
 
 ## 6. 必须复现的已知故障
 
@@ -107,14 +94,14 @@ export DSV4_DEPLOY_ROOT=/root/vllm_p800/dsv4
 export DSV4_MODEL_DIR=/root/donlin_model/DeepSeek-V4-Flash-0731-W8A8
 
 tools/deepseek_v4_flash_0731/smoke_test.py
-tools/deepseek_v4_flash_0731/smoke_test.py --check-logprobs
+tools/deepseek_v4_flash_0731/smoke_test.py --check-logprobs --repeat 10
 ```
 
-当前典型现象是：冷启动后的第一个请求正确；第二个独立请求返回连续 token id 0，
-解码成重复 `<｜begin▁of▁sentence｜>`，或者 completion 为空；请求 logprobs 时服务因
-`Out of range float values are not JSON compliant` 返回 400。
+旧实现的典型现象是：若干短请求后返回 token id 0，logprobs 因非有限值返回 400。
+2026-08-16 17:18 CST 的最新干净重启已修复该问题，并通过 30 个顺序 logprobs
+请求。接手后仍应重新运行测试，不要只依赖本文记录。
 
-每次改动后的最小验收应是：冷启动、连续三个确定性请求、再重复一轮、logprobs，
+每次改动后的最小验收应是：冷启动、至少连续 30 个确定性请求、logprobs，
 最后才是并发和长上下文。仅 `/health=200` 只能证明进程活着；仅首请求正确会漏掉
 当前最重要的错误。
 
@@ -138,6 +125,19 @@ tools/deepseek_v4_flash_0731/smoke_test.py --check-logprobs
 MLA tensor；即使强制每次 zero，第二请求仍失败。继续调试时应先找到第一个非有限
 中间张量，而不是继续扩大清零范围。
 
+### 已定位：非连续 indexer cache writer 污染相邻 SWA cache
+
+vLLM 的异构 KV 分配器会返回带 padding/block stride 的 packed-page view。P800
+原生 `indexer_k_quant_and_cache` 按紧凑布局写该 view，会跨 cache entry 写入相邻
+SWA cache。实测第 10 个短请求时 layer 0 SWA cache 出现 148 个非有限元素。修复方式
+是在紧凑 scratch cache 中量化，再按目标 view 的真实 stride 逐行复制有效行。
+
+### 已定位：P800 Triton logprob kernel 静默产生非有限值
+
+模型 logits 正常时，vLLM 0.25.1 的 GPU sampler Triton logprob kernel 在 P800 上仍
+可能返回非有限值。现在使用 torch FP32 `logsumexp`、gather 和 rank 计算，并 patch
+sampler 的缓存引用。
+
 ### 0.15.1 的经验不能原样套用
 
 原来 Qwen 能在 vLLM-Kunlun 0.15.1 跑通，只说明驱动和 P800 基础栈可用。0.25.1
@@ -158,18 +158,10 @@ conda create -y -p /root/vllm_p800/dsv4/conda \
 
 ## 8. 推荐的下一步调试方法
 
-1. 用两个顺序的 `max_tokens=1` 请求复现，降低日志量。
-2. 在每个 decoder layer 出口记录 `isfinite/all`、min/max；先定位第二请求首次变坏
-   的层，再进入该层，不要一开始全模型逐算子打日志。
-3. 请求前后给 parameters 和 persistent buffers 做轻量 fingerprint，查 in-place
-   weight/buffer mutation。
-4. 检查 sparse indexer、compressor、top-k buffer、request index、slot mapping、
-   block table 和 metadata 是否按请求重置，尤其关注 reference fallback 与 upstream
-   kernel 对 buffer 生命周期的不同假设。
-5. 找到第一个异常 tensor 后，对照 upstream vLLM 0.25.1 的 CUDA/XPU shape、stride、
-   dtype 和有效行范围。
-6. 修复后运行 `smoke_test.py`、logprobs、多轮、并发、32K，再与 NVIDIA upstream
-   运行同一 W8A8 checkpoint 的贪心输出/评测集对比。
+1. 做 30 分钟以上顺序和并发 soak test，观察 block 复用。
+2. 做 32K、chunked prefill、不同 prompt 长度和多轮上下文。
+3. 与 NVIDIA upstream 运行同一 W8A8 checkpoint 做输出/评测对比。
+4. 记录 torch-native logprob 和 scratch cache fallback 的性能开销。
 
 采集现场信息可运行：
 

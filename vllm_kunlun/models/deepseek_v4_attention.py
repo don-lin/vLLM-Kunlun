@@ -340,7 +340,7 @@ class KunlunDeepseekV4SparseAttnIndexer(torch.nn.Module):
         indexer_metadata = metadata[self.k_cache.prefix]
         kv_cache = self.k_cache.kv_cache
         if not self.skip_k_cache_insert:
-            torch.ops.xspeedgate_ops.indexer_k_quant_and_cache(
+            _indexer_quant_and_cache_(
                 k,
                 kv_cache,
                 indexer_metadata.slot_mapping,
@@ -596,7 +596,47 @@ def _index_copy_paged_cache_(
     block_size = cache.shape[-2]
     block_ids = torch.div(slots, block_size, rounding_mode="floor")
     block_offsets = slots % block_size
-    cache[block_ids, block_offsets] = values
+    # These views come from vLLM's heterogeneous packed-page allocator and
+    # have a block stride larger than ``block_size * row_width``. P800's
+    # advanced-index assignment on such a view has been observed to overwrite
+    # neighboring packed cache regions, leaving NaNs that surface when the
+    # scheduler reaches a later block. Use direct row copies so every write
+    # respects the view's real stride/storage offset.
+    for block_id, block_offset, value in zip(
+        block_ids.unbind(), block_offsets.unbind(), values.unbind()
+    ):
+        cache[block_id, block_offset].copy_(value)
+
+
+def _indexer_quant_and_cache_(
+    values: torch.Tensor,
+    cache: torch.Tensor,
+    slots: torch.Tensor,
+    quant_block_size: int,
+    scale_fmt: str,
+) -> None:
+    """Quantize indexer K rows without writing through a padded-page view."""
+    if cache.is_contiguous():
+        torch.ops.xspeedgate_ops.indexer_k_quant_and_cache(
+            values, cache, slots, quant_block_size, scale_fmt
+        )
+        return
+
+    valid = slots >= 0
+    scratch = torch.empty(
+        (values.shape[0], 1, cache.shape[-1]),
+        dtype=cache.dtype,
+        device=cache.device,
+    )
+    scratch_slots = torch.where(
+        valid,
+        torch.arange(values.shape[0], device=slots.device, dtype=slots.dtype),
+        torch.full_like(slots, -1),
+    )
+    torch.ops.xspeedgate_ops.indexer_k_quant_and_cache(
+        values, scratch, scratch_slots, quant_block_size, scale_fmt
+    )
+    _index_copy_paged_cache_(cache, slots[valid], scratch[valid, 0])
 
 
 def _reference_sparse_attention(
@@ -997,7 +1037,7 @@ class KunlunDeepseekCompressor(DeepseekCompressor):
         else:
             # The Lightning Indexer cache remains int8+scale and is consumed by
             # the existing Kunlun sparse-indexer kernels.
-            torch.ops.xspeedgate_ops.indexer_k_quant_and_cache(
+            _indexer_quant_and_cache_(
                 values, k_cache, out_slots, 128, "ue8m0"
             )
 
