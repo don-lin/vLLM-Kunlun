@@ -21,6 +21,36 @@ _upstream_cls = _upstream_utils.KVBlockZeroer
 logger = logging.getLogger("vllm_kunlun")
 
 
+def _init(
+    self,
+    device,
+    pin_memory,
+    attn_groups_iter,
+    kernel_block_sizes,
+    cache_dtype,
+    static_forward_context,
+    runner_only_attn_layers=None,
+):
+    """vLLM 0.25.1 ``KVBlockZeroer.__init__`` replacement for Kunlun.
+
+    Upstream builds a raw-address table consumed by a Triton kernel. Kunlun
+    keeps tensor references and clears their scheduler pages with eager torch
+    operations instead.
+    """
+    self.device = device
+    self.pin_memory = pin_memory
+    if runner_only_attn_layers is None:
+        runner_only_attn_layers = set()
+    _init_meta(
+        self,
+        attn_groups_iter,
+        kernel_block_sizes,
+        cache_dtype,
+        runner_only_attn_layers,
+        static_forward_context,
+    )
+
+
 def bind_kv_cache(
     kv_caches: dict[str, object],
     forward_context: dict[str, object],
@@ -65,6 +95,8 @@ def _init_meta(
     from vllm.v1.kv_cache_interface import FullAttentionSpec
 
     kv_entries = []
+    compatible_groups = 0
+    spec_types = set()
     # Dedup by Python object identity rather than ``data_ptr()``: K and V
     # tensors of an interleaved/strided layout can share underlying
     # storage (and therefore data_ptr), which would otherwise cause one
@@ -73,8 +105,10 @@ def _init_meta(
     seen_ids = set()
     for group in attn_groups_iter:
         spec = group.kv_cache_spec
-        if type(spec) is not FullAttentionSpec:
+        if not isinstance(spec, FullAttentionSpec):
             continue
+        compatible_groups += 1
+        spec_types.add(type(spec).__name__)
         if group.kv_cache_group_id >= len(kernel_block_sizes):
             continue
         kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
@@ -135,19 +169,23 @@ def _init_meta(
                     continue
                 kv_entries.append((kv, actual_dim, ratio))
     self._kv_entries = kv_entries
-    # logger.info(
-    #     "[KunlunPlugin] KVBlockZeroer.init_meta: %d kv tensors registered; "
-    #     "shapes/dims/ratios=%s",
-    #     len(kv_entries),
-    #     [(tuple(t.shape), d, r) for (t, d, r) in kv_entries],
-    # )
+    logger.info(
+        "[KunlunPlugin] KVBlockZeroer registered %d tensors from %d groups "
+        "(specs=%s)",
+        len(kv_entries),
+        compatible_groups,
+        sorted(spec_types),
+    )
 
 
 def _zero_block_ids(self, block_ids):
-    # //todo because ssm_state dtype is only fp16, so zero_block_ids is not needed
-    return
     if not block_ids or not getattr(self, "_kv_entries", None):
         return
+    # DeepSeek V4's compressor and sparse-attention caches are stateful across
+    # decode steps. Newly assigned scheduler blocks must be cleared before
+    # reuse; otherwise a second request observes the previous request's state
+    # and its logits quickly become non-finite. The historical Kunlun shortcut
+    # returned here because the original SSM-only path did not need clearing.
     for kv, block_dim, ratio in self._kv_entries:
         dim_size = kv.shape[block_dim]
         if ratio == 1:
@@ -166,6 +204,7 @@ def _zero_block_ids(self, block_ids):
 
 # Idempotent monkey-patch: safe under fork() and re-import.
 if not getattr(_upstream_cls, "_kunlun_patched", False):
+    _upstream_cls.__init__ = _init
     _upstream_cls.init_meta = _init_meta
     _upstream_cls.zero_block_ids = _zero_block_ids
     _upstream_cls._kunlun_patched = True
