@@ -22,6 +22,16 @@ def test_mxfp4_dequantization_values():
     torch.testing.assert_close(out[0, 1::2], torch.full((16,), -6.0))
 
 
+def test_mxfp4_signed_storage_preserves_nibbles():
+    # Official 0731 expert weights use safetensors I8 storage even though the
+    # byte contains two unsigned E2M1 nibbles.
+    packed = torch.tensor([[-15] * 16], dtype=torch.int8)  # bit pattern 0xF1
+    scales = torch.tensor([[127]], dtype=torch.uint8)
+    out = converter.dequantize_mxfp4(packed, scales)
+    torch.testing.assert_close(out[0, 0::2], torch.full((16,), 0.5))
+    torch.testing.assert_close(out[0, 1::2], torch.full((16,), -6.0))
+
+
 def test_channel_int8_roundtrip():
     weight = torch.tensor([[0.0, 1.0, -2.0], [10.0, -5.0, 2.5]])
     quantized, scale = converter.quantize_w8a8_channel(weight)

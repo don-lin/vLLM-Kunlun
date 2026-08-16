@@ -364,6 +364,25 @@ def register():
     logger = _configure_kunlun_logger()
     logger.info("[KunlunPlugin] register() pid=%s", os.getpid())
 
+    # vLLM 0.25.1 names the native MXFP4/E8M0 dtypes added in PyTorch 2.11
+    # from modules that are imported even when those quantization paths are
+    # unused.  P800's PyTorch 2.5 frontend does not expose the names.  Use
+    # distinct, non-torch.dtype sentinels so import-time comparisons work
+    # without ever mistaking a real uint8 tensor for FP4/E8M0.  The supported
+    # DeepSeek V4 profile is preconverted W8A8 and never executes these paths.
+    import torch as _torch
+
+    class _UnsupportedTorchDType:
+        def __init__(self, name):
+            self.name = name
+
+        def __repr__(self):
+            return f"torch.{self.name} (unsupported on Kunlun PyTorch)"
+
+    for _dtype_name in ("float4_e2m1fn_x2", "float8_e8m0fnu"):
+        if not hasattr(_torch, _dtype_name):
+            setattr(_torch, _dtype_name, _UnsupportedTorchDType(_dtype_name))
+
     # --- block vllm's NVIDIA prebuilt _C / _moe_C from being loaded ---
     # These are imported (via top-level ``import vllm._C`` in
     # ``vllm.platforms.cuda`` / inside ``Platform.import_kernels``) by

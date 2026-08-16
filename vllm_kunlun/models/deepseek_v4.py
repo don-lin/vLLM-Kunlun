@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import types
 
 from vllm.platforms import current_platform
 
@@ -15,6 +16,39 @@ _UPSTREAM_PACKAGE = "vllm.models.deepseek_v4"
 if _UPSTREAM_PACKAGE not in sys.modules:
     _had_instance_override = "is_xpu" in vars(current_platform)
     _instance_override = vars(current_platform).get("is_xpu")
+    _temporary_modules = []
+
+    # Selecting the upstream XPU topology temporarily makes the generic
+    # fused-MoE package import Intel's optional vllm_xpu_kernels interface.
+    # Kunlun never instantiates that expert backend, but the import happens
+    # before our own MoE implementation can be selected.  Provide a scoped
+    # placeholder solely while the topology package is initialized.
+    if "vllm_xpu_kernels.fused_moe_interface" not in sys.modules:
+        _xpu_moe_stub = types.ModuleType("vllm_xpu_kernels.fused_moe_interface")
+
+        class _UnavailableXpuFusedMoe:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError(
+                    "Intel vllm_xpu_kernels is unavailable on Kunlun; "
+                    "the Kunlun MoE backend should have been selected"
+                )
+
+        _xpu_moe_stub.XpuFusedMoe = _UnavailableXpuFusedMoe
+        sys.modules["vllm_xpu_kernels.fused_moe_interface"] = _xpu_moe_stub
+        _temporary_modules.append("vllm_xpu_kernels.fused_moe_interface")
+    if "vllm_xpu_kernels.flash_attn_interface" not in sys.modules:
+        _xpu_attn_stub = types.ModuleType("vllm_xpu_kernels.flash_attn_interface")
+
+        def _unavailable_xpu_flash_attn(*args, **kwargs):
+            raise RuntimeError(
+                "Intel vllm_xpu_kernels is unavailable on Kunlun; "
+                "the Kunlun attention backend should have been selected"
+            )
+
+        _xpu_attn_stub.flash_attn_varlen_func = _unavailable_xpu_flash_attn
+        sys.modules["vllm_xpu_kernels.flash_attn_interface"] = _xpu_attn_stub
+        _temporary_modules.append("vllm_xpu_kernels.flash_attn_interface")
+
     current_platform.is_xpu = lambda: True
     try:
         importlib.import_module(_UPSTREAM_PACKAGE)
@@ -23,6 +57,8 @@ if _UPSTREAM_PACKAGE not in sys.modules:
             current_platform.is_xpu = _instance_override
         else:
             del current_platform.is_xpu
+        for _temporary_module in reversed(_temporary_modules):
+            sys.modules.pop(_temporary_module, None)
 
 # Import and patch the shared topology only at model-resolution time.  vLLM's
 # XPU implementation is the closest platform-neutral 0.25.1 topology (no

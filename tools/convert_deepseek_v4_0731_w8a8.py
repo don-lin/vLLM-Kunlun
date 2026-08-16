@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import shutil
+import struct
 from pathlib import Path
 
 import torch
@@ -50,8 +51,10 @@ FP4_E2M1 = torch.tensor(
 
 def dequantize_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Decode E2M1 pairs with UE8M0 scales (32 values per scale byte)."""
-    if packed.dtype != torch.uint8:
-        raise TypeError(f"MXFP4 values must be uint8, got {packed.dtype}")
+    if packed.dtype == torch.int8:
+        packed = packed.view(torch.uint8)
+    elif packed.dtype != torch.uint8:
+        raise TypeError(f"MXFP4 values must be int8/uint8, got {packed.dtype}")
     scale_bytes = scale.view(torch.uint8) if scale.dtype != torch.uint8 else scale
     low = packed.bitwise_and(0x0F).long()
     high = packed.bitwise_right_shift(4).bitwise_and(0x0F).long()
@@ -190,10 +193,36 @@ class Checkpoint:
                 with safe_open(shard, framework="pt", device="cpu") as handle:
                     self.weight_map.update({name: shard.name for name in handle.keys()})
             self.index = {"metadata": {}, "weight_map": self.weight_map}
+        self._headers: dict[str, tuple[int, dict]] = {}
+
+    def _header(self, shard_name: str) -> tuple[int, dict]:
+        cached = self._headers.get(shard_name)
+        if cached is not None:
+            return cached
+        with (self.source / shard_name).open("rb") as handle:
+            header_size = struct.unpack("<Q", handle.read(8))[0]
+            header = json.loads(handle.read(header_size))
+        cached = (8 + header_size, header)
+        self._headers[shard_name] = cached
+        return cached
 
     def load(self, name: str) -> torch.Tensor:
+        shard_name = self.weight_map[name]
+        data_start, header = self._header(shard_name)
+        tensor_info = header[name]
+        if tensor_info["dtype"] == "F8_E8M0":
+            # PyTorch gained float8_e8m0fnu after the 2.5 frontend shipped
+            # with P800.  UE8M0 is exponent-only, so preserving its raw byte
+            # representation is exactly what dequantize_mxfp4 expects.
+            begin, end = tensor_info["data_offsets"]
+            with (self.source / shard_name).open("rb") as handle:
+                handle.seek(data_start + begin)
+                payload = bytearray(handle.read(end - begin))
+            return torch.frombuffer(payload, dtype=torch.uint8).reshape(
+                tensor_info["shape"]
+            )
         with safe_open(
-            self.source / self.weight_map[name], framework="pt", device="cpu"
+            self.source / shard_name, framework="pt", device="cpu"
         ) as handle:
             return handle.get_tensor(name)
 
@@ -246,7 +275,7 @@ def convert(source: Path, output: Path, dry_run: bool = False) -> dict:
             if not should_quantize(name, tensor):
                 if should_keep_unquantized(name):
                     scale_name = companion_scale_name(name, all_names)
-                    if tensor.dtype == torch.uint8:
+                    if tensor.dtype in (torch.uint8, torch.int8):
                         if scale_name is None:
                             raise ValueError(
                                 f"Packed unquantized tensor has no scale: {name}"
@@ -273,7 +302,7 @@ def convert(source: Path, output: Path, dry_run: bool = False) -> dict:
                 continue
 
             scale_name = companion_scale_name(name, all_names)
-            if tensor.dtype == torch.uint8:
+            if tensor.dtype in (torch.uint8, torch.int8):
                 if scale_name is None:
                     raise ValueError(f"Packed MXFP4 tensor has no scale: {name}")
                 tensor = dequantize_mxfp4(tensor, checkpoint.load(scale_name))

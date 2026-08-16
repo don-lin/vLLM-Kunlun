@@ -115,3 +115,19 @@ def patch_annotations_for_schema(func):
 
 
 torch_utils_orig.direct_register_custom_op = direct_register_custom_op
+
+
+# vLLM 0.25.1 targets PyTorch 2.11, whose infer_schema accepts PEP 585/604
+# annotations such as ``list[int]`` and ``Tensor | None``.  The Kunlun P800
+# runtime currently ships a PyTorch 2.5 based frontend.  Some vLLM modules
+# cache direct_register_custom_op before this plugin replaces it, so patch the
+# module-global infer_schema used by the cached upstream function as well.
+_torch_infer_schema = torch_utils_orig.infer_schema
+
+
+def _infer_schema_compat(func, mutates_args):
+    patch_annotations_for_schema(func)
+    return _torch_infer_schema(func, mutates_args=mutates_args)
+
+
+torch_utils_orig.infer_schema = _infer_schema_compat
