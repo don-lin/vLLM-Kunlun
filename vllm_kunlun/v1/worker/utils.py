@@ -181,11 +181,10 @@ def _init_meta(
 def _zero_block_ids(self, block_ids):
     if not block_ids or not getattr(self, "_kv_entries", None):
         return
-    # DeepSeek V4's compressor and sparse-attention caches are stateful across
-    # decode steps. Newly assigned scheduler blocks must be cleared before
-    # reuse; otherwise a second request observes the previous request's state
-    # and its logits quickly become non-finite. The historical Kunlun shortcut
-    # returned here because the original SSM-only path did not need clearing.
+    # Keep the eager Kunlun implementation correct for cache configurations
+    # where upstream vLLM explicitly requests page clearing. The historical
+    # Kunlun implementation was a no-op because its original SSM-only path did
+    # not require this operation.
     for kv, block_dim, ratio in self._kv_entries:
         dim_size = kv.shape[block_dim]
         if ratio == 1:
