@@ -85,6 +85,14 @@ def register_model():
         "DeepseekV32ForCausalLM", "vllm_kunlun.models.deepseek_v2:DeepseekV3ForCausalLM"
     )
 
+    # DeepSeek-V4-Flash-0731.  Keep the upstream architecture name so that
+    # unmodified Hugging Face configs are resolved by ModelRegistry, while the
+    # implementation replaces the CUDA/XPU platform seams with Kunlun ones.
+    ModelRegistry.register_model(
+        "DeepseekV4ForCausalLM",
+        "vllm_kunlun.models.deepseek_v4:KunlunDeepseekV4ForCausalLM",
+    )
+
     ModelRegistry.register_model(
         "DeepSeekMTPModel", "vllm_kunlun.models.deepseek_mtp:DeepSeekMTP"
     )

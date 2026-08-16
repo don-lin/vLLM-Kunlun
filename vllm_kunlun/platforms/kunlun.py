@@ -214,6 +214,90 @@ class KunlunPlatform(Platform):
         # scheduler_config = vllm_config.scheduler_config
         model_config = vllm_config.model_config
 
+        hf_config = getattr(model_config, "hf_config", None)
+        is_deepseek_v4 = getattr(hf_config, "model_type", None) == "deepseek_v4"
+
+        # DeepSeek-V4-Flash-0731 support on Kunlun is deliberately narrow for
+        # the first release.  Fail here, before cache allocation/model loading,
+        # instead of falling through to NVIDIA-only DSpark/FP8/graph kernels.
+        if is_deepseek_v4:
+            if vllm_config.speculative_config is not None:
+                raise NotImplementedError(
+                    "DeepSeek V4 on Kunlun does not support speculative "
+                    "decoding (DSpark/MTP) yet. Remove speculative decoding "
+                    "arguments and run the main model only."
+                )
+
+            if model_config.dtype != torch.bfloat16:
+                raise ValueError(
+                    "DeepSeek V4 on Kunlun currently requires --dtype bfloat16."
+                )
+
+            if (
+                parallel_config.tensor_parallel_size != 8
+                or parallel_config.pipeline_parallel_size != 1
+                or parallel_config.data_parallel_size != 1
+                or parallel_config.decode_context_parallel_size != 1
+                or parallel_config.enable_expert_parallel
+            ):
+                raise NotImplementedError(
+                    "DeepSeek V4 on Kunlun is currently validated only for "
+                    "single-node P800 x8 with TP=8, PP=1, DP=1, DCP=1 and "
+                    "expert parallel disabled."
+                )
+
+            quant_config = vllm_config.quant_config
+            if (
+                quant_config is None
+                or "CompressedTensors" not in type(quant_config).__name__
+            ):
+                raise NotImplementedError(
+                    "DeepSeek V4 on Kunlun requires a preconverted W8A8 "
+                    "compressed-tensors checkpoint and "
+                    "--quantization compressed-tensors. Direct MXFP4 loading "
+                    "is not supported."
+                )
+
+            cache_config = vllm_config.cache_config
+            if cache_config is not None:
+                if cache_config.cache_dtype == "auto":
+                    cache_config.cache_dtype = "bfloat16"
+                elif cache_config.cache_dtype != "bfloat16":
+                    raise NotImplementedError(
+                        "DeepSeek V4 on Kunlun currently supports BF16 KV cache "
+                        "only; use --kv-cache-dtype bfloat16."
+                    )
+                if cache_config.block_size not in (None, 256):
+                    raise ValueError(
+                        "DeepSeek V4 on Kunlun requires --block-size 256; got "
+                        f"{cache_config.block_size}."
+                    )
+                cache_config.block_size = 256
+
+            max_model_len = getattr(model_config, "max_model_len", 0)
+            if max_model_len > 32768:
+                raise NotImplementedError(
+                    "DeepSeek V4 on Kunlun is validated up to 32768 tokens; "
+                    f"got max_model_len={max_model_len}."
+                )
+
+            moe_backend = getattr(vllm_config.kernel_config, "moe_backend", "auto")
+            if moe_backend == "deep_gemm_mega_moe":
+                raise NotImplementedError(
+                    "DeepSeek V4 MegaMoE is NVIDIA-only. Use the default "
+                    "Kunlun compressed-tensors W8A8 MoE backend."
+                )
+
+            from vllm.config import CUDAGraphMode
+
+            vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            vllm_config.compilation_config.backend = "eager"
+            model_config.enforce_eager = True
+            logger.info_once(
+                "DeepSeek V4 Kunlun profile: BF16 KV cache, block_size=256, "
+                "max_model_len<=32768, eager execution."
+            )
+
         if parallel_config.worker_cls == "auto":
             # v0.15.1 do not support v0.15.1, remove the if condition
             if vllm_config.speculative_config:
@@ -228,7 +312,7 @@ class KunlunPlatform(Platform):
 
         # TODO(lucas): handle this more gracefully
         # Note: model_config may be None during testing
-        if model_config is not None and model_config.use_mla:
+        if model_config is not None and model_config.use_mla and not is_deepseek_v4:
             # if `VLLM_ATTENTION_BACKEND` is not set and we are using MLA, then
             # we default to FlashMLA backend, so we need to force the blocksize
             # here
@@ -310,9 +394,7 @@ class KunlunPlatform(Platform):
                 )
             return "vllm_kunlun.v1.attention.backends.mla.flashmla.FlashMLABackend"
 
-        return (
-            "vllm_kunlun.v1.attention.backends.kunlun_attn.KunlunAttentionBackend"
-        )
+        return "vllm_kunlun.v1.attention.backends.kunlun_attn.KunlunAttentionBackend"
 
     @classmethod
     def get_current_memory_usage(

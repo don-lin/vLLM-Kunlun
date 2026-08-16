@@ -158,6 +158,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
+        hash_indices_table: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         hidden_states = x
         global_num_experts, up_gate_size, _ = layer.w13_weight.shape
@@ -175,6 +176,21 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
             dtype=torch.int32,
             device=hidden_states.device,
         )
+
+        # vLLM 0.25.1 only passes (layer, x, router_logits, input_ids) to a
+        # monolithic method.  Read routing policy from RoutedExperts so this
+        # also works with the older expanded call signature above.
+        scoring_func = getattr(layer, "scoring_func", scoring_func)
+        routed_scaling_factor = getattr(
+            layer, "routed_scaling_factor", routed_scaling_factor
+        )
+        e_score_correction_bias = getattr(
+            layer, "e_score_correction_bias", e_score_correction_bias
+        )
+        hash_indices_table = getattr(
+            layer, "_kunlun_hash_indices_table", hash_indices_table
+        )
+        renormalize = getattr(layer, "renormalize", True)
 
         router_logits = router_logits.float()
         if scoring_func == "softmax":
@@ -195,6 +211,31 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
                 n_group=num_expert_group,
                 topk_group=topk_group,
                 scale=routed_scaling_factor,
+            )
+        elif scoring_func == "sqrtsoftplus":
+            # DeepSeek V4 routing.  The correction bias affects expert
+            # selection only; the gathered weights always come from the
+            # unbiased sqrt(softplus(logit)) scores.
+            scores = torch.sqrt(torch.nn.functional.softplus(router_logits))
+            if hash_indices_table is not None:
+                if input_ids is None:
+                    raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+                topk = hash_indices_table[input_ids.long()].long()
+            else:
+                choice = scores
+                if e_score_correction_bias is not None:
+                    choice = choice + e_score_correction_bias.float().unsqueeze(0)
+                topk = torch.topk(choice, k=top_k, dim=-1, sorted=False).indices
+            normed_score.copy_(scores.gather(1, topk).float())
+            if renormalize:
+                normed_score.div_(
+                    normed_score.sum(dim=-1, keepdim=True).clamp_min_(1e-20)
+                )
+            normed_score.mul_(routed_scaling_factor)
+            topk_ids.copy_(topk.to(torch.int32))
+        else:
+            raise ValueError(
+                f"Unsupported Kunlun W8A8 MoE scoring function: {scoring_func}"
             )
 
         if M * top_k > 768:
@@ -270,7 +311,15 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         d = y.shape[-1] // 2
         output_shape = y.shape[:-1] + (d,)
         out1 = torch.empty(output_shape, dtype=y.dtype, device=y.device)
-        torch.ops._C.silu_and_mul(out1, y)
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
+        if swiglu_limit is None:
+            torch.ops._C.silu_and_mul(out1, y)
+        else:
+            # DeepSeek V4 clamps both halves before the SwiGLU multiply.
+            gate, up = y[..., :d], y[..., d:]
+            gate = gate.clamp(max=float(swiglu_limit))
+            up = up.clamp(min=-float(swiglu_limit), max=float(swiglu_limit))
+            out1.copy_(torch.nn.functional.silu(gate) * up)
 
         del y
 

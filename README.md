@@ -19,6 +19,7 @@
 
 ## Latest News 🔥
 
+- [2026/08] 🚧 **DeepSeek-V4-Flash-0731 (experimental)** — Added the main-model W8A8 eager path for P800 TP8; DSpark/MTP and FP8 KV cache remain unsupported
 - [2026/07] 🚧 **v0.25.1 under development** — Added Qwen3.5 / Qwen3.5-MoE, Gemma4 (text and multimodal), GLM MoE DSA, and DFlash speculative decoding
 - [2026/02] ⚡ **Performance optimizations** — Fused MoE with small batches, optimized attention metadata building, Multi-LoRA inference achieves 80%+ of non-LoRA performance
 - [2026/02] 🔧 **DeepSeek-V3.2 MTP support** — Added MTP (Multi-Token Prediction) for DeepSeek-V3.2, with RoPE and decoding stage kernel optimizations
@@ -89,6 +90,7 @@ This plugin provides a hardware-pluggable interface that decouples the integrati
 | DeepSeek-R1 | ✅ | ✅ | | ✅ |
 | DeepSeek-V3 | ✅ | ✅ | | ✅ |
 | DeepSeek-V3.2 | ✅ | ✅ | | ✅ |
+| DeepSeek-V4-Flash-0731 | 🚧 | W8A8 | | Eager only |
 | Kimi-K2 | ✅ | ✅ | | ✅ |
 
 ### Multimodal Language Models
@@ -232,4 +234,3 @@ We sincerely appreciate the [**KunLunXin**](https://www.kunlunxin.com/) team for
 ## License
 
 Apache License 2.0, as found in the [LICENSE](./LICENSE) file.
-
