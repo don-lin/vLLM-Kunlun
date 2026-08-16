@@ -403,22 +403,53 @@ class KunlunDeepseekV4SparseAttnIndexer(torch.nn.Module):
         token_slice = slice(chunk.token_start, chunk.token_end)
         q_rows = q_quant[token_slice].float()
         row_weights = weights[token_slice].float()
-        logits = torch.einsum(
-            "thd,kd,th->tk", q_rows, k_int8, row_weights
-        )
-        logits *= k_scales.unsqueeze(0)
-
         topk = output[token_slice, : self.topk_tokens]
-        row_starts = chunk.cu_seqlen_ks.cpu().tolist()
-        row_ends = chunk.cu_seqlen_ke.cpu().tolist()
-        for row_idx, (start, end) in enumerate(zip(row_starts, row_ends)):
-            width = min(self.topk_tokens, end - start)
-            if width <= 0:
-                continue
-            local_indices = torch.topk(
-                logits[row_idx, start:end], width
-            ).indices
-            topk[row_idx, :width] = local_indices.to(topk.dtype)
+        row_starts = chunk.cu_seqlen_ks.long()
+        row_ends = chunk.cu_seqlen_ke.long()
+
+        # Algebraically contract the index heads before multiplying by K:
+        #
+        #   einsum("thd,kd,th->tk", q, k, w)
+        #     == ((q * w[..., None]).sum(1) @ k.T)
+        #
+        # The original einsum path may materialize its [T,H,K] intermediate.
+        # For a near-32K prefill that is tens of GiB and kills every TP worker.
+        # Process query rows in bounded chunks and discard each logits tile
+        # immediately after extracting top-k.
+        weighted_q = (q_rows * row_weights.unsqueeze(-1)).sum(dim=1)
+        max_logits_bytes = 64 << 20
+        rows_per_chunk = max(
+            1,
+            min(
+                weighted_q.shape[0],
+                max_logits_bytes // max(4 * k_int8.shape[0], 1),
+            ),
+        )
+        k_transposed = k_int8.t().contiguous()
+        key_offsets = torch.arange(k_int8.shape[0], device=q_quant.device)
+        rank_offsets = torch.arange(self.topk_tokens, device=q_quant.device)
+        for query_start in range(0, weighted_q.shape[0], rows_per_chunk):
+            query_end = min(query_start + rows_per_chunk, weighted_q.shape[0])
+            logits = torch.mm(
+                weighted_q[query_start:query_end], k_transposed
+            )
+            logits.mul_(k_scales.unsqueeze(0))
+            starts = row_starts[query_start:query_end]
+            ends = row_ends[query_start:query_end]
+            valid_keys = key_offsets.unsqueeze(0) >= starts.unsqueeze(1)
+            valid_keys &= key_offsets.unsqueeze(0) < ends.unsqueeze(1)
+            logits.masked_fill_(~valid_keys, -float("inf"))
+
+            select_width = min(self.topk_tokens, logits.shape[1])
+            selected = torch.topk(logits, select_width, dim=1).indices
+            selected.sub_(starts.unsqueeze(1))
+            widths = (ends - starts).clamp(min=0, max=select_width)
+            valid_ranks = rank_offsets[:select_width].unsqueeze(0)
+            valid_ranks = valid_ranks < widths.unsqueeze(1)
+            topk_chunk = topk[query_start:query_end, :select_width]
+            topk_chunk.copy_(
+                torch.where(valid_ranks, selected, -1).to(topk.dtype)
+            )
 
     def _decode(
         self, q_quant, weights, kv_cache, output, metadata, num_decode_tokens
